@@ -118,6 +118,14 @@ const double kResonancePassiveDecay = 0.15;
 /// Maximum resonance charge
 const double kMaxResonance = 120.0;
 
+/// ── Resonance Axiom scaling ──
+/// These control how strongly R(t) contributes to Φ_eff.
+/// kResonanceScale controls the base multiplier for the R(t) term so that
+/// resonance has a meaningful impact (not squashed to [0..1]).
+const double kResonanceScale = 50.0;  // R(t) scaled to [0..50]
+/// Maximum ∫ρΠ before clamping — prevents runaway integral
+const double kIntegralCap = 5.0;
+
 // ─── CORE EQUATIONS ─────────────────────────────────────────────────────────
 
 /// (1) Effective Offline Connectivity
@@ -152,15 +160,19 @@ double computeMPercent(MBatteryParams p) {
 /// (3) Resonance Continuity Axiom (Rule 61)
 ///     Φ_eff(t) = Φ(t) + R(t) ⋅ (1 + ∫₀ᵗ ρ(s) ⋅ Π(s) ds)
 ///
-///     Φ(t) = raw connectivity (we use EOC as the base)
-///     R(t) = resonance charge at time t
-///     ρ(s) = resonance density at sample s  (we approximate with a list)
-///     Π(s) = priority weight at sample s
+///     Φ(t) = raw connectivity (we use EOC as the base, scaled to [0..100])
+///     R(t) = resonance charge at time t, scaled via kResonanceScale
+///     ρ(s) = resonance density at sample s  — how much resonance "field"
+///            existed at moment s.  Online: ρ(s) = EOC(s). Offline: ρ(s) =
+///            EOC(s) × offline_attenuation × message_activity_boost.
+///     Π(s) = priority weight at sample s — boosted when messages are sent
+///            (reflects user intent/urgency amplifying the field).
 ///
 ///   The integral is approximated via trapezoidal rule over historical samples.
+///   The integral is capped at kIntegralCap to prevent runaway growth.
 double computePhiEff({
-  required double phiRaw,        // Φ(t) — raw connectivity = EOC
-  required double resonance,     // R(t)
+  required double phiRaw,        // Φ(t) — raw connectivity = EOC × 100
+  required double resonance,     // R(t) — [0..kMaxResonance]
   required List<double> rhoPi,   // ρ(s)⋅Π(s) samples collected over time
   required double dt,            // time step between samples (minutes)
 }) {
@@ -169,9 +181,15 @@ double computePhiEff({
   for (int i = 1; i < rhoPi.length; i++) {
     integral += (rhoPi[i - 1] + rhoPi[i]) / 2.0 * dt;
   }
+  // Cap the integral so it doesn't grow forever
+  integral = integral.clamp(0.0, kIntegralCap);
 
-  // Φ_eff(t) = Φ(t) + R(t) ⋅ (1 + integral)
-  final phiEff = phiRaw + resonance * (1.0 + integral);
+  // Scale R(t) to a meaningful contribution range [0..kResonanceScale]
+  // instead of normalizing to [0..1] which makes the term negligible
+  final scaledR = (resonance / kMaxResonance) * kResonanceScale;
+
+  // Φ_eff(t) = Φ(t) + R_scaled(t) ⋅ (1 + ∫ρΠ)
+  final phiEff = phiRaw + scaledR * (1.0 + integral);
   return phiEff.clamp(0.0, 200.0);
 }
 
@@ -371,7 +389,12 @@ class DigitalTwin {
 
 // ─── THE MAIN ENGINE ────────────────────────────────────────────────────────
 /// ConnectivityBatteryEngine drives the entire math model.
-/// It ticks every second, computes all equations, and notifies listeners.
+/// It ticks every 2 seconds, computes all equations, and notifies listeners.
+///
+/// IMPORTANT:
+/// The engine now tracks message sync state authoritatively via
+/// `markMessageSynced(id)` and `unsyncedMessageIds`. The chat screen
+/// should call these instead of maintaining a separate sync-state list.
 class ConnectivityBatteryEngine extends ChangeNotifier {
   // ── State ──
   EOCParams eocParams = EOCParams();
@@ -392,6 +415,12 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   // ── Resonance integral samples: ρ(s)⋅Π(s) ──
   final List<double> _rhoPiSamples = [];
 
+  /// ── Π(s) priority accumulator ──
+  /// Every time a message is sent, the priority weight for the NEXT sample
+  /// is boosted. This makes the integral capture "user intent" — sending
+  /// messages while offline amplifies the resonance field.
+  double _pendingPriorityBoost = 0.0;
+
   // ── History for graph ──
   final List<BatterySnapshot> _history = [];
 
@@ -400,6 +429,11 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
 
   // ── Timer ──
   Timer? _ticker;
+
+  // ── Force-offline listener callback ──
+  /// The chat screen registers a callback so it can pause/resume
+  /// its Firebase subscription when force-offline toggles.
+  VoidCallback? onForceOfflineChanged;
 
   // ── Getters ──
   double get currentEOC => _currentEOC;
@@ -413,6 +447,11 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   List<BatterySnapshot> get history => List.unmodifiable(_history);
   List<PrioritizedMessage> get messageQueue => List.unmodifiable(_messageQueue);
   int get queuedCount => _messageQueue.where((m) => !m.synced).length;
+
+  /// IDs of messages that haven't been synced to Firestore yet.
+  /// The chat screen uses this to know what to push on reconnect.
+  Set<String> get unsyncedMessageIds =>
+      _messageQueue.where((m) => !m.synced).map((m) => m.id).toSet();
 
   /// Start the engine tick
   void startEngine() {
@@ -442,12 +481,20 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
 
   /// Force offline mode (testing)
   void setForceOffline(bool force) {
+    final changed = _forceOffline != force;
     _forceOffline = force;
     if (force) {
       _lastOnlineTime = DateTime.now();
+    } else if (!force && changed) {
+      // Coming back online from force-offline → connection pulse
+      _onConnectionPulse();
     }
     _tick();
     notifyListeners();
+    // Notify chat screen so it can pause/resume Firebase streams
+    if (changed) {
+      onForceOfflineChanged?.call();
+    }
   }
 
   /// Perform the Home Charging Ritual
@@ -487,18 +534,20 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     // Clear integral samples, start fresh
     _rhoPiSamples.clear();
     _rhoPiSamples.add(1.0); // initial ρ⋅Π = 1.0 at full charge
+    _pendingPriorityBoost = 0.0;
 
     // Mark charged
     _isCharged = true;
 
-    // Mark charged history
+    // Clear history
     _history.clear();
 
     _tick();
     notifyListeners();
   }
 
-  /// Queue a message for sending
+  /// Queue a message for sending.
+  /// If the engine is effectively online, mark synced immediately.
   PrioritizedMessage queueMessage({
     required String id,
     required String content,
@@ -507,6 +556,8 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     // Semantic compression
     final (compressed, ratio) = compressor.compress(content);
 
+    final effectiveOnline = _isOnline && !_forceOffline;
+
     final msg = PrioritizedMessage(
       id: id,
       content: content,
@@ -514,6 +565,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
       compressionRatio: ratio,
       priority: priority,
       createdAt: DateTime.now(),
+      synced: effectiveOnline, // pre-mark synced if online
     );
 
     _messageQueue.add(msg);
@@ -522,15 +574,34 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     mParams.semanticReservoir = (mParams.semanticReservoir - 1.0).clamp(0.0, 100.0);
     mParams.keyEnvelopeStock = (mParams.keyEnvelopeStock - 0.5).clamp(0.0, 100.0);
 
+    // Boost Π(s) — user intent during offline amplifies the resonance field
+    if (!effectiveOnline) {
+      _pendingPriorityBoost += priority.weight * 0.15;
+      // Offline messages also increase the loss counter slightly
+      // (they risk being lost until synced)
+      mParams.loss = (mParams.loss + 0.3).clamp(0.0, 100.0);
+    }
+
     _tick();
     notifyListeners();
     return msg;
   }
 
-  /// Mark messages as synced (when internet pulse happens)
-  int syncMessages() {
+  /// Mark a specific message as synced by ID.
+  /// Called by the chat screen when Firebase confirms the write.
+  void markMessageSynced(String messageId) {
+    final idx = _messageQueue.indexWhere((m) => m.id == messageId);
+    if (idx >= 0 && !_messageQueue[idx].synced) {
+      _messageQueue[idx].synced = true;
+      // Reduce loss — successful delivery
+      mParams.loss = (mParams.loss - 0.3).clamp(0.0, 100.0);
+    }
+  }
+
+  /// Mark all unsynced messages as synced (batch sync completed).
+  int syncAllMessages() {
     int synced = 0;
-    // Sort by priority
+    // Sort by priority — highest priority first
     final pending = _messageQueue.where((m) => !m.synced).toList()
       ..sort((a, b) => b.effectivePriority.compareTo(a.effectivePriority));
     for (final msg in pending) {
@@ -538,7 +609,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
       synced++;
     }
     // Reduce loss counter on successful sync
-    mParams.loss = (mParams.loss - synced * 0.5).clamp(0.0, 100.0);
+    mParams.loss = (mParams.loss - synced * 0.3).clamp(0.0, 100.0);
     _tick();
     notifyListeners();
     return synced;
@@ -548,7 +619,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   void _onConnectionPulse() {
     _currentResonance = (_currentResonance + kResonancePulseBoost)
         .clamp(0.0, kMaxResonance);
-    // Add a high ρ⋅Π sample
+    // Add a high ρ⋅Π sample — pulse is a burst of connectivity
     _rhoPiSamples.add(0.8 + Random().nextDouble() * 0.2);
 
     // Reduce disconnect duration
@@ -593,8 +664,26 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     _currentM = computeM(mParams);
 
     // ── Compute Φ_eff(t) using Resonance Continuity Axiom ──
-    // Add current ρ⋅Π sample
-    final rhoPi = _currentEOC * (effectiveOnline ? 1.0 : 0.3);
+    //
+    // Build the ρ(s)⋅Π(s) sample for this tick:
+    //   ρ(s) = EOC(s) × connectivity_factor
+    //     Online:  connectivity_factor = 1.0
+    //     Offline: connectivity_factor = 0.3  (residual field from cache)
+    //   Π(s) = base_priority + pending_boost
+    //     base_priority = 1.0
+    //     pending_boost = accumulated from recent message sends
+    //
+    // This means: sending messages while offline actually BOOSTS the
+    // integral, making Φ_eff higher — the act of communicating strengthens
+    // the resonance field. This is the "perceived continuity" effect.
+    final rho = _currentEOC * (effectiveOnline ? 1.0 : 0.3);
+    final pi = 1.0 + _pendingPriorityBoost;
+    final rhoPi = rho * pi;
+
+    // Decay the priority boost gradually so it doesn't stick forever
+    _pendingPriorityBoost *= 0.95;
+    if (_pendingPriorityBoost < 0.001) _pendingPriorityBoost = 0.0;
+
     _rhoPiSamples.add(rhoPi);
     // Keep only last 300 samples (10 minutes at 2s intervals)
     if (_rhoPiSamples.length > 300) {
@@ -602,10 +691,10 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     }
 
     _currentPhiEff = computePhiEff(
-      phiRaw: _currentEOC * 100.0,     // scale EOC [0..1] → [0..100]
-      resonance: _currentResonance / kMaxResonance, // normalize to [0..1]
+      phiRaw: _currentEOC * 100.0,        // scale EOC [0..1] → [0..100]
+      resonance: _currentResonance,         // pass raw R(t), scaling is in computePhiEff
       rhoPi: _rhoPiSamples,
-      dt: 2.0 / 60.0,                  // 2 seconds → minutes
+      dt: 2.0 / 60.0,                     // 2 seconds → minutes
     );
 
     // ── Record snapshot ──

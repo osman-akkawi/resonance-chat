@@ -6,6 +6,30 @@ class FirebaseService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
+  // ── Network isolation for Force Offline ──
+  bool _networkDisabled = false;
+
+  /// Disable Firestore network access — forces all reads to come from
+  /// local cache only, and prevents any writes from reaching the server.
+  /// This is critical for the Force Offline testing mode.
+  Future<void> disableNetwork() async {
+    if (!_networkDisabled) {
+      await _firestore.disableNetwork();
+      _networkDisabled = true;
+    }
+  }
+
+  /// Re-enable Firestore network access — queued writes will flush
+  /// and snapshots will sync from the server.
+  Future<void> enableNetwork() async {
+    if (_networkDisabled) {
+      await _firestore.enableNetwork();
+      _networkDisabled = false;
+    }
+  }
+
+  bool get isNetworkDisabled => _networkDisabled;
+
   // ── Auth ──
   User? get currentUser => _auth.currentUser;
   Stream<User?> get authStateChanges => _auth.authStateChanges();
@@ -79,7 +103,10 @@ class FirebaseService {
     return '${sorted[0]}_${sorted[1]}';
   }
 
-  /// Send a message to Firestore
+  /// Send a message to Firestore.
+  /// IMPORTANT: Callers must check force-offline BEFORE calling this.
+  /// If Firestore network is disabled, this write will be queued locally
+  /// by Firestore's own offline persistence and flushed on enableNetwork().
   Future<void> sendMessage(ChatMessage message) async {
     final roomId = _chatRoomId(message.senderId, message.receiverId);
     await _firestore
@@ -129,8 +156,10 @@ class FirebaseService {
     return snap.docs.map((d) => d.data()['content'] as String? ?? '').toList();
   }
 
-  /// Sync queued offline messages to Firestore
+  /// Sync queued offline messages to Firestore.
+  /// IMPORTANT: Caller must ensure force-offline is NOT active before calling.
   Future<int> syncOfflineMessages(List<ChatMessage> messages) async {
+    if (_networkDisabled) return 0; // safety guard
     int synced = 0;
     final batch = _firestore.batch();
     for (final msg in messages) {

@@ -26,20 +26,34 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final _scrollCtrl = ScrollController();
   final _uuid = const Uuid();
 
-  List<ChatMessage> _messages = [];
-  final List<ChatMessage> _offlineQueue = [];
+  // ── Single source of truth for displayed messages ──
+  // keyed by message ID to prevent duplicates.
+  final Map<String, ChatMessage> _messageMap = {};
+
+  // ── IDs of messages we created locally (need sync tracking) ──
+  final Set<String> _localMessageIds = {};
+
   StreamSubscription? _messagesSub;
   Timer? _syncTimer;
 
   @override
   void initState() {
     super.initState();
-    _listenToMessages();
+    _startFirestoreStream();
     _startSyncTimer();
+
+    // Register for force-offline changes so we can pause/resume the stream
+    final engine = context.read<ConnectivityBatteryEngine>();
+    engine.onForceOfflineChanged = _onForceOfflineChanged;
   }
 
   @override
   void dispose() {
+    // Unregister callback
+    final engine = context.read<ConnectivityBatteryEngine>();
+    if (engine.onForceOfflineChanged == _onForceOfflineChanged) {
+      engine.onForceOfflineChanged = null;
+    }
     _messagesSub?.cancel();
     _syncTimer?.cancel();
     _textCtrl.dispose();
@@ -47,61 +61,124 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  void _listenToMessages() {
-    _messagesSub = _firebase.streamMessages(widget.otherUser.uid).listen(
-      (msgs) {
-        setState(() {
-          // Merge Firestore messages with offline queue
-          final firestoreIds = msgs.map((m) => m.id).toSet();
-          final nonDuplicateOffline =
-              _offlineQueue.where((m) => !firestoreIds.contains(m.id)).toList();
+  // ─── FIREBASE STREAM MANAGEMENT ───────────────────────────────────────────
+  // The stream is PAUSED when force-offline is active and RESUMED when it's
+  // disabled. This prevents any Firestore reads/writes from leaking through
+  // the local cache while the user is testing offline mode.
 
-          // Mark synced in offline queue
-          for (final msg in _offlineQueue) {
-            if (firestoreIds.contains(msg.id)) {
-              final idx = _offlineQueue.indexOf(msg);
-              _offlineQueue[idx] = msg.copyWith(
-                isSynced: true,
-                deliveryMethod: 'resonance',
-              );
+  void _startFirestoreStream() {
+    final engine = context.read<ConnectivityBatteryEngine>();
+    // Don't start the stream at all if force-offline is active
+    if (engine.isForceOffline) return;
+
+    _messagesSub?.cancel();
+    _messagesSub = _firebase.streamMessages(widget.otherUser.uid).listen(
+      (firestoreMsgs) {
+        if (!mounted) return;
+        setState(() {
+          for (final msg in firestoreMsgs) {
+            // If this is a message we sent locally, preserve our local metadata
+            // but mark it as synced now that Firestore has confirmed it.
+            if (_localMessageIds.contains(msg.id)) {
+              final local = _messageMap[msg.id];
+              if (local != null && !local.isSynced) {
+                _messageMap[msg.id] = local.copyWith(
+                  isSynced: true,
+                  deliveryMethod: local.isOffline ? 'resonance' : 'live',
+                );
+                // Tell the engine this message is confirmed synced
+                final engine = context.read<ConnectivityBatteryEngine>();
+                engine.markMessageSynced(msg.id);
+              }
+              // Skip overwriting with Firestore's copy — our local copy is richer
+            } else {
+              // Message from the other user or from another session — accept it
+              _messageMap[msg.id] = msg;
             }
           }
-
-          _messages = [...msgs, ...nonDuplicateOffline];
-          _messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
         });
         _scrollToBottom();
       },
     );
   }
 
-  void _startSyncTimer() {
-    // Every 5 seconds, try to sync offline messages
-    _syncTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      final engine = context.read<ConnectivityBatteryEngine>();
-      final connectivity = context.read<ConnectivityService>();
+  void _stopFirestoreStream() {
+    _messagesSub?.cancel();
+    _messagesSub = null;
+  }
 
-      if (connectivity.isOnline && !engine.isForceOffline) {
-        final unsynced = _offlineQueue.where((m) => !m.isSynced).toList();
-        if (unsynced.isNotEmpty) {
-          try {
-            await _firebase.syncOfflineMessages(unsynced);
-            setState(() {
-              for (int i = 0; i < _offlineQueue.length; i++) {
-                if (!_offlineQueue[i].isSynced) {
-                  _offlineQueue[i] = _offlineQueue[i].copyWith(
-                    isSynced: true,
-                    deliveryMethod: 'resonance',
-                  );
-                }
-              }
-            });
-            engine.syncMessages();
-          } catch (_) {}
-        }
-      }
+  void _onForceOfflineChanged() {
+    if (!mounted) return;
+    final engine = context.read<ConnectivityBatteryEngine>();
+    if (engine.isForceOffline) {
+      _stopFirestoreStream();
+      // Disable Firestore network — no reads or writes reach the server
+      _firebase.disableNetwork();
+    } else {
+      // Re-enable Firestore network — pending writes flush, snapshots sync
+      _firebase.enableNetwork().then((_) {
+        _startFirestoreStream();
+        // Trigger immediate sync of queued messages
+        _syncNow();
+      });
+    }
+  }
+
+  // ─── SYNC TIMER ───────────────────────────────────────────────────────────
+  // Every 5 seconds, check if we can sync offline messages to Firebase.
+  // Only runs when NOT in force-offline mode AND device has connectivity.
+
+  void _startSyncTimer() {
+    _syncTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _syncNow();
     });
   }
+
+  Future<void> _syncNow() async {
+    if (!mounted) return;
+    final engine = context.read<ConnectivityBatteryEngine>();
+    final connectivity = context.read<ConnectivityService>();
+
+    // CRITICAL: Do NOT sync if force-offline is active, even if device has
+    // real connectivity. The whole point of force-offline is to simulate
+    // zero connectivity for testing.
+    if (engine.isForceOffline) return;
+    if (!connectivity.isOnline) return;
+
+    // Gather un-synced local messages
+    final unsyncedIds = engine.unsyncedMessageIds;
+    final toSync = <ChatMessage>[];
+    for (final id in unsyncedIds) {
+      final msg = _messageMap[id];
+      if (msg != null && _localMessageIds.contains(id)) {
+        toSync.add(msg);
+      }
+    }
+    if (toSync.isEmpty) return;
+
+    try {
+      await _firebase.syncOfflineMessages(toSync);
+      if (!mounted) return;
+      setState(() {
+        for (final msg in toSync) {
+          engine.markMessageSynced(msg.id);
+          _messageMap[msg.id] = msg.copyWith(
+            isSynced: true,
+            deliveryMethod: 'resonance',
+          );
+        }
+      });
+      // Also persist sync state locally
+      final localStorage = context.read<LocalStorageService>();
+      for (final msg in toSync) {
+        localStorage.markSynced(msg.id);
+      }
+    } catch (_) {
+      // Network error — will retry on next tick
+    }
+  }
+
+  // ─── SEND MESSAGE ─────────────────────────────────────────────────────────
 
   void _sendMessage() {
     final text = _textCtrl.text.trim();
@@ -110,13 +187,18 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     final engine = context.read<ConnectivityBatteryEngine>();
     final connectivity = context.read<ConnectivityService>();
     final myUid = _firebase.currentUser?.uid ?? '';
+
+    // CRITICAL: effectiveOnline must respect BOTH real connectivity AND
+    // the force-offline flag. If force-offline is on, we treat it as
+    // offline regardless of actual network state.
     final effectiveOnline = connectivity.isOnline && !engine.isForceOffline;
 
     // Compress message
     final (compressed, ratio) = engine.compressor.compress(text);
 
+    final msgId = _uuid.v4();
     final message = ChatMessage(
-      id: _uuid.v4(),
+      id: msgId,
       senderId: myUid,
       receiverId: widget.otherUser.uid,
       content: text,
@@ -124,41 +206,43 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       compressionRatio: ratio,
       timestamp: DateTime.now(),
       isOffline: !effectiveOnline,
-      isSynced: false,
+      isSynced: false, // always start unsynced — confirmed by Firebase callback
       deliveryMethod: effectiveOnline ? 'live' : 'resonance',
     );
 
-    // Queue in engine
+    // Track this as a locally-created message
+    _localMessageIds.add(msgId);
+
+    // Queue in engine (engine handles battery consumption + sync tracking)
     engine.queueMessage(
-      id: message.id,
+      id: msgId,
       content: text,
     );
 
-    // Store locally
+    // Store locally for persistence across app restarts
     final localStorage = context.read<LocalStorageService>();
     localStorage.queueMessage(message);
 
-    if (effectiveOnline) {
-      // Send directly
-      _firebase.sendMessage(message).then((_) {
-        setState(() {
-          final idx = _offlineQueue.indexWhere((m) => m.id == message.id);
-          if (idx >= 0) {
-            _offlineQueue[idx] = message.copyWith(isSynced: true);
-          }
-        });
-      });
-    }
-
+    // Add to display immediately — user sees it instantly
     setState(() {
-      _offlineQueue.add(message);
-      // Add to merged list immediately for instant UI
-      _messages.add(message);
-      _messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      _messageMap[msgId] = message;
     });
-
     _textCtrl.clear();
     _scrollToBottom();
+
+    if (effectiveOnline) {
+      // Send directly to Firebase — do NOT send if force-offline
+      _firebase.sendMessage(message).then((_) {
+        if (!mounted) return;
+        setState(() {
+          engine.markMessageSynced(msgId);
+          _messageMap[msgId] = message.copyWith(isSynced: true);
+        });
+        localStorage.markSynced(msgId);
+      }).catchError((_) {
+        // Firebase write failed (rare) — will be retried by sync timer
+      });
+    }
 
     // Digital twin: generate predicted reply if offline
     if (!effectiveOnline) {
@@ -173,8 +257,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
     final prediction = engine.digitalTwin.predictReply(lastMessage);
     if (prediction != null && mounted) {
+      final predictedId = '${_uuid.v4()}_predicted';
       final predicted = ChatMessage(
-        id: '${_uuid.v4()}_predicted',
+        id: predictedId,
         senderId: widget.otherUser.uid,
         receiverId: _firebase.currentUser?.uid ?? '',
         content: prediction,
@@ -184,7 +269,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       );
 
       setState(() {
-        _messages.add(predicted);
+        _messageMap[predictedId] = predicted;
       });
       _scrollToBottom();
     }
@@ -202,12 +287,21 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     });
   }
 
+  // ─── SORTED MESSAGE LIST ──────────────────────────────────────────────────
+
+  List<ChatMessage> get _sortedMessages {
+    final list = _messageMap.values.toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    return list;
+  }
+
   @override
   Widget build(BuildContext context) {
     final engine = context.watch<ConnectivityBatteryEngine>();
     final connectivity = context.watch<ConnectivityService>();
     final myUid = _firebase.currentUser?.uid ?? '';
     final effectiveOnline = connectivity.isOnline && !engine.isForceOffline;
+    final messages = _sortedMessages;
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -329,9 +423,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             child: ListView.builder(
               controller: _scrollCtrl,
               padding: const EdgeInsets.symmetric(vertical: 12),
-              itemCount: _messages.length,
+              itemCount: messages.length,
               itemBuilder: (context, index) {
-                final msg = _messages[index];
+                final msg = messages[index];
                 return ChatBubble(
                   message: msg,
                   isMe: msg.senderId == myUid,
