@@ -5,6 +5,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:provider/provider.dart';
 
+import 'firebase_options.dart';
 import 'core/theme.dart';
 import 'engine/connectivity_battery.dart';
 import 'services/connectivity_service.dart';
@@ -26,8 +27,10 @@ void main() async {
     statusBarIconBrightness: Brightness.light,
   ));
 
-  // Initialize Firebase
-  await Firebase.initializeApp();
+  // Initialize Firebase with platform-specific options
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
 
   // Enable Firestore persistence (offline-first)
   FirebaseFirestore.instance.settings = const Settings(
@@ -48,9 +51,7 @@ void main() async {
 
   // Listen to connectivity changes and feed the engine
   connectivityService.addListener(() {
-    engine.updateConnectivity(
-      connectivityService.isOnline && !engine.isForceOffline,
-    );
+    engine.updateConnectivity(connectivityService.isOnline);
   });
 
   runApp(

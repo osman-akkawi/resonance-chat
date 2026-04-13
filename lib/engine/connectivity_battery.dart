@@ -408,7 +408,6 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   double _currentPhiEff = 0.0;
   double _currentResonance = 0.0;
   bool _isOnline = true;
-  bool _forceOffline = false;
   bool _isCharged = false;
   DateTime _lastOnlineTime = DateTime.now();
 
@@ -430,10 +429,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   // ── Timer ──
   Timer? _ticker;
 
-  // ── Force-offline listener callback ──
-  /// The chat screen registers a callback so it can pause/resume
-  /// its Firebase subscription when force-offline toggles.
-  VoidCallback? onForceOfflineChanged;
+
 
   // ── Getters ──
   double get currentEOC => _currentEOC;
@@ -441,8 +437,8 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
   double get currentPhiEff => _currentPhiEff;
   double get currentResonance => _currentResonance;
   double get reservePercent => (_currentPhiEff / 200.0 * 100.0).clamp(0.0, 100.0);
-  bool get isOnline => _isOnline && !_forceOffline;
-  bool get isForceOffline => _forceOffline;
+  bool get isOnline => _isOnline;
+  bool get isForceOffline => false; // legacy — always false now
   bool get isCharged => _isCharged;
   List<BatterySnapshot> get history => List.unmodifiable(_history);
   List<PrioritizedMessage> get messageQueue => List.unmodifiable(_messageQueue);
@@ -479,23 +475,9 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     _tick();
   }
 
-  /// Force offline mode (testing)
-  void setForceOffline(bool force) {
-    final changed = _forceOffline != force;
-    _forceOffline = force;
-    if (force) {
-      _lastOnlineTime = DateTime.now();
-    } else if (!force && changed) {
-      // Coming back online from force-offline → connection pulse
-      _onConnectionPulse();
-    }
-    _tick();
-    notifyListeners();
-    // Notify chat screen so it can pause/resume Firebase streams
-    if (changed) {
-      onForceOfflineChanged?.call();
-    }
-  }
+  /// Legacy — kept for API compatibility but does nothing.
+  /// Real offline is detected via ConnectivityService.
+  void setForceOffline(bool force) {}
 
   /// Perform the Home Charging Ritual
   void performChargingRitual({
@@ -556,7 +538,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
     // Semantic compression
     final (compressed, ratio) = compressor.compress(content);
 
-    final effectiveOnline = _isOnline && !_forceOffline;
+    final effectiveOnline = _isOnline;
 
     final msg = PrioritizedMessage(
       id: id,
@@ -629,7 +611,7 @@ class ConnectivityBatteryEngine extends ChangeNotifier {
 
   /// Main tick — recompute all equations
   void _tick() {
-    final effectiveOnline = _isOnline && !_forceOffline;
+    final effectiveOnline = _isOnline;
 
     // ── Update disconnect duration ──
     if (!effectiveOnline) {

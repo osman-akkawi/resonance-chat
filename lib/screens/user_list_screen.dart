@@ -29,36 +29,43 @@ class _UserListScreenState extends State<UserListScreen> {
       appBar: AppBar(
         title: const Text('RESONANCE'),
         actions: [
-          // Force Offline toggle
-          IconButton(
-            icon: Icon(
-              engine.isForceOffline
-                  ? Icons.airplanemode_active
-                  : Icons.airplanemode_inactive,
-              color: engine.isForceOffline
-                  ? AppColors.energyAmber
-                  : AppColors.textMuted,
-            ),
-            tooltip: 'Force Offline',
-            onPressed: () {
-              engine.setForceOffline(!engine.isForceOffline);
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    engine.isForceOffline
-                        ? '✈ Force Offline: ON — Simulating zero connectivity'
-                        : '📶 Force Offline: OFF — Back to real connectivity',
-                  ),
-                  backgroundColor: engine.isForceOffline
-                      ? AppColors.energyAmber
-                      : AppColors.energyGreen,
-                  behavior: SnackBarBehavior.floating,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+          // Connection status indicator
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: connectivity.isOnline
+                        ? AppColors.energyGreen
+                        : Colors.red,
+                    boxShadow: connectivity.isOnline
+                        ? [
+                            BoxShadow(
+                              color: AppColors.energyGreen.withOpacity(0.4),
+                              blurRadius: 6,
+                            ),
+                          ]
+                        : null,
                   ),
                 ),
-              );
-            },
+                const SizedBox(width: 4),
+                Text(
+                  connectivity.isOnline ? 'Online' : 'Offline',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: connectivity.isOnline
+                        ? AppColors.energyGreen
+                        : Colors.red,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
           ),
           // Dashboard
           IconButton(
@@ -93,9 +100,40 @@ class _UserListScreenState extends State<UserListScreen> {
             mBattery: engine.currentM,
             resonance: engine.currentResonance,
             isOnline: connectivity.isOnline,
-            forceOffline: engine.isForceOffline,
+            forceOffline: !connectivity.isOnline,
           ),
-          const SizedBox(height: 8),
+
+          // Offline warning banner
+          if (!connectivity.isOnline)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.red.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.red.withOpacity(0.3)),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.airplanemode_active,
+                      color: Colors.redAccent, size: 18),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'You are offline. Messages will queue locally and sync when connected.',
+                      style: TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          const SizedBox(height: 4),
 
           // Users list
           Expanded(
@@ -106,6 +144,39 @@ class _UserListScreenState extends State<UserListScreen> {
                   return const Center(
                     child: CircularProgressIndicator(
                       color: AppColors.resonancePrimary,
+                    ),
+                  );
+                }
+
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.error_outline,
+                            size: 48,
+                            color: Colors.red.withOpacity(0.5)),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Error loading users',
+                          style: TextStyle(
+                              color: AppColors.textMuted, fontSize: 14),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${snapshot.error}',
+                          style: TextStyle(
+                            color: AppColors.textMuted.withOpacity(0.6),
+                            fontSize: 11,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 16),
+                        TextButton(
+                          onPressed: () => setState(() {}),
+                          child: const Text('Retry'),
+                        ),
+                      ],
                     ),
                   );
                 }
@@ -131,7 +202,7 @@ class _UserListScreenState extends State<UserListScreen> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Create a second test account\nto start chatting',
+                          'Sign up with a different email\non another device to start chatting',
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: AppColors.textMuted.withOpacity(0.6),
@@ -192,7 +263,6 @@ class _UserTile extends StatelessWidget {
         ),
         child: Row(
           children: [
-            // Avatar
             Container(
               width: 48,
               height: 48,
@@ -237,7 +307,6 @@ class _UserTile extends StatelessWidget {
                 ],
               ),
             ),
-            // Online indicator
             Container(
               width: 10,
               height: 10,
